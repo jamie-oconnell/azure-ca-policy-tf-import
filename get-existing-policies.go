@@ -1,10 +1,8 @@
 package main
 
 import (
-	"context"
 	"fmt"
 
-	azidentity "github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	msgraphsdk "github.com/microsoftgraph/msgraph-sdk-go"
 	msgraphcore "github.com/microsoftgraph/msgraph-sdk-go-core"
 	"github.com/microsoftgraph/msgraph-sdk-go/models"
@@ -26,24 +24,10 @@ func printOdataError(err error) {
 	}
 }
 
-// configureCredentials configures Azure credentials.
-func configureCredentials(ctx context.Context) (*azidentity.AzureCLICredential, error) {
-	cred, err := azidentity.NewAzureCLICredential(nil)
-	if err != nil {
-		return nil, fmt.Errorf("error creating credentials: %v", err)
-	}
-	return cred, nil
-}
-
 // fetchExistingPolicies fetches existing conditional access policies.
-func fetchExistingPolicies(ctx context.Context, cred *azidentity.AzureCLICredential) ([]models.ConditionalAccessPolicy, error) {
-	scopes := []string{"https://graph.microsoft.com/.default"}
-	client, err := msgraphsdk.NewGraphServiceClientWithCredentials(cred, scopes)
-	if err != nil {
-		return nil, fmt.Errorf("error creating client: %v", err)
-	}
+func fetchExistingPolicies(client *msgraphsdk.GraphServiceClient) ([]models.ConditionalAccessPolicy, error) {
 
-	result, err := client.Identity().ConditionalAccess().Policies().Get(ctx, nil)
+	result, err := client.Identity().ConditionalAccess().Policies().Get(nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("error getting CA policies: %v", err)
 	}
@@ -56,7 +40,7 @@ func fetchExistingPolicies(ctx context.Context, cred *azidentity.AzureCLICredent
 
 	var policies []models.ConditionalAccessPolicy
 
-	err = pageIterator.Iterate(ctx, func(capolicy *models.ConditionalAccessPolicy) bool {
+	err = pageIterator.Iterate(nil, func(capolicy *models.ConditionalAccessPolicy) bool {
 		policies = append(policies, *capolicy)
 		// Return true to continue the iteration
 		return true
@@ -68,17 +52,9 @@ func fetchExistingPolicies(ctx context.Context, cred *azidentity.AzureCLICredent
 	return policies, nil
 }
 
-func getExistingPolicies() ([]models.ConditionalAccessPolicy, error) {
-	ctx := context.Background()
-
-	// Configure Azure credentials
-	cred, err := configureCredentials(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("error configuring credentials: %v", err)
-	}
-
+func getExistingPolicies(client *msgraphsdk.GraphServiceClient) ([]models.ConditionalAccessPolicy, error) {
 	// Fetch existing policies
-	policies, err := fetchExistingPolicies(ctx, cred)
+	policies, err := fetchExistingPolicies(client)
 	if err != nil {
 		return nil, fmt.Errorf("error fetching policies: %v", err)
 	}

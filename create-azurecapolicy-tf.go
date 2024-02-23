@@ -5,12 +5,77 @@ import (
 	"os"
 	"strings"
 
+	"github.com/hashicorp/hcl/v2"
+	"github.com/hashicorp/hcl/v2/hclsyntax"
 	"github.com/hashicorp/hcl/v2/hclwrite"
+	msgraphsdk "github.com/microsoftgraph/msgraph-sdk-go"
 	"github.com/microsoftgraph/msgraph-sdk-go/models"
 	"github.com/zclconf/go-cty/cty"
 )
 
-func create_azurecapolicy(policy models.ConditionalAccessPolicy) {
+const dataFilePath = "generated/data.tf"
+
+func createDataFile() error {
+	_, err := os.Create(dataFilePath)
+	return err
+}
+
+func openDataFile() (*os.File, error) {
+	return os.OpenFile(dataFilePath, os.O_APPEND|os.O_WRONLY, 0644)
+}
+
+func addUserToDataFile(upn string) error {
+	formattedUpn := strings.ReplaceAll(strings.ReplaceAll(upn, "@", "_"), ".", "_")
+	return addDataBlock("azuread_user", formattedUpn, "user_principal_name", upn)
+}
+
+func addGroupToDataFile(group string) error {
+	formattedGroupName := strings.ReplaceAll(group, " ", "_")
+	return addDataBlock("azuread_group", formattedGroupName, "display_name", group)
+}
+
+func addNamedLocationToDataFile(location string) error {
+	formattedLocationName := strings.ReplaceAll(location, " ", "_")
+	return addDataBlock("azuread_named_location", formattedLocationName, "display_name", location)
+}
+
+func addDataBlock(entityType, entityName, attributeName, attributeValue string) error {
+	tfFile, err := openDataFile()
+	if err != nil {
+		return err
+	}
+	defer tfFile.Close()
+
+	f := hclwrite.NewFile()
+	rootBody := f.Body()
+
+	dataBlock := rootBody.AppendNewBlock("data", []string{entityType, entityName})
+	dataBlockBody := dataBlock.Body()
+	dataBlockBody.SetAttributeValue(attributeName, cty.StringVal(attributeValue))
+
+	rootBody.AppendNewline()
+	_, err = tfFile.Write(f.Bytes())
+	return err
+}
+
+func isEntityInDataFile(entityType, entityName string) (bool, error) {
+	data, err := os.ReadFile(dataFilePath)
+	if err != nil {
+		return false, err
+	}
+
+	hclFile, diag := hclwrite.ParseConfig(data, "", hcl.InitialPos)
+	if diag.HasErrors() {
+		return false, err
+	}
+
+	var findInDataFile = hclFile.Body().FirstMatchingBlock("data", []string{entityType, entityName})
+
+	return findInDataFile != nil, nil
+}
+
+func create_azurecapolicy(policy models.ConditionalAccessPolicy, client *msgraphsdk.GraphServiceClient) {
+
 	// create new empty hcl file object
 	f := hclwrite.NewEmptyFile()
 
@@ -95,12 +160,43 @@ func create_azurecapolicy(policy models.ConditionalAccessPolicy) {
 		conditionsBlockBody.AppendNewline()
 	}
 
+	appendNamedLocationsBlock := func(body *hclwrite.Body, locations []string, attribute string) {
+		if len(locations) == 0 {
+			return
+		}
+		locationTokens := hclwrite.Tokens{}
+		locationTokens = append(locationTokens, &hclwrite.Token{Type: hclsyntax.TokenOBrack, Bytes: []byte{'['}})
+		for i, location := range locations {
+			displayName, err := get_aad_ca_named_location_from_id(location, client)
+			if err != nil {
+				fmt.Printf("Error getting Named Location display name: %v\n", err)
+				return
+			}
+			var formattedLocationName = strings.ReplaceAll(displayName, " ", "_")
+			isInDataFile, err := isEntityInDataFile("azuread_named_location", formattedLocationName)
+			if err != nil {
+				fmt.Println("Error checking if user is in data file:", err)
+				return
+			}
+			if !isInDataFile {
+				addNamedLocationToDataFile(displayName)
+			}
+			locationTokens = append(locationTokens, &hclwrite.Token{Type: hclsyntax.TokenIdent, Bytes: []byte(fmt.Sprintf("data.azuread_named_location.%s.id", formattedLocationName))})
+			// if not the last location, add a comma
+			if i < len(locations)-1 {
+				locationTokens = append(locationTokens, &hclwrite.Token{Type: hclsyntax.TokenComma, Bytes: []byte{','}})
+			}
+		}
+		locationTokens = append(locationTokens, &hclwrite.Token{Type: hclsyntax.TokenCBrack, Bytes: []byte{']'}})
+		body.SetAttributeRaw(attribute, locationTokens)
+	}
+
 	// Add locations block
 	if policy.GetConditions() != nil && policy.GetConditions().GetLocations() != nil {
 		locationsBlock := conditionsBlockBody.AppendNewBlock("locations", nil)
 		locationsBlockBody := locationsBlock.Body()
-		setIfNotEmpty(locationsBlockBody, "included_locations", policy.GetConditions().GetLocations().GetIncludeLocations())
-		setIfNotEmpty(locationsBlockBody, "excluded_locations", policy.GetConditions().GetLocations().GetExcludeLocations())
+		appendNamedLocationsBlock(locationsBlockBody, policy.GetConditions().GetLocations().GetIncludeLocations(), "included_locations")
+		appendNamedLocationsBlock(locationsBlockBody, policy.GetConditions().GetLocations().GetExcludeLocations(), "excluded_locations")
 		conditionsBlockBody.AppendNewline()
 	}
 
@@ -120,13 +216,84 @@ func create_azurecapolicy(policy models.ConditionalAccessPolicy) {
 		setIfNotEmpty(platformsBlockBody, "excluded_platforms", excludePlatforms)
 	}
 
+	appendUsersBlock := func(body *hclwrite.Body, users []string, attribute string) {
+		if len(users) == 0 {
+			return
+		}
+		userTokens := hclwrite.Tokens{}
+		userTokens = append(userTokens, &hclwrite.Token{Type: hclsyntax.TokenOBrack, Bytes: []byte{'['}})
+		for i, user := range users {
+			if user != "All" && user != "None" && user != "GuestsOrExternalUsers" {
+				upn, err := get_aad_upn_from_id(user, client)
+				if err != nil {
+					fmt.Printf("Error getting UPN: %v\n", err)
+					return
+				}
+				var formattedUpn = strings.ReplaceAll(upn, "@", "_")
+				formattedUpn = strings.ReplaceAll(formattedUpn, ".", "_")
+				isInDataFile, err := isEntityInDataFile("azuread_user", formattedUpn)
+				if err != nil {
+					fmt.Println("Error checking if user is in data file:", err)
+					return
+				}
+				if !isInDataFile {
+					addUserToDataFile(upn)
+				}
+				userTokens = append(userTokens, &hclwrite.Token{Type: hclsyntax.TokenIdent, Bytes: []byte(fmt.Sprintf("data.azuread_user.%s.id", formattedUpn))})
+				// if not the last user, add a comma
+				if i < len(users)-1 {
+					userTokens = append(userTokens, &hclwrite.Token{Type: hclsyntax.TokenComma, Bytes: []byte{','}})
+				}
+			} else {
+				userTokens = append(userTokens, &hclwrite.Token{Type: hclsyntax.TokenQuotedLit, Bytes: []byte(fmt.Sprintf("\"%s\"", user))})
+				// if not the last user, add a comma
+				if i < len(users)-1 {
+					userTokens = append(userTokens, &hclwrite.Token{Type: hclsyntax.TokenComma, Bytes: []byte{','}})
+				}
+			}
+		}
+		userTokens = append(userTokens, &hclwrite.Token{Type: hclsyntax.TokenCBrack, Bytes: []byte{']'}})
+		body.SetAttributeRaw(attribute, userTokens)
+	}
+
+	appendGroupsBlock := func(body *hclwrite.Body, groups []string, attribute string) {
+		if len(groups) == 0 {
+			return
+		}
+		groupTokens := hclwrite.Tokens{}
+		groupTokens = append(groupTokens, &hclwrite.Token{Type: hclsyntax.TokenOBrack, Bytes: []byte{'['}})
+		for i, group := range groups {
+			displayName, err := get_aad_display_name_from_id(group, client)
+			if err != nil {
+				fmt.Printf("Error getting Group display name: %v\n", err)
+				return
+			}
+			var formattedGroupName = strings.ReplaceAll(displayName, " ", "_")
+			isInDataFile, err := isEntityInDataFile("azuread_group", formattedGroupName)
+			if err != nil {
+				fmt.Println("Error checking if user is in data file:", err)
+				return
+			}
+			if !isInDataFile {
+				addGroupToDataFile(displayName)
+			}
+			groupTokens = append(groupTokens, &hclwrite.Token{Type: hclsyntax.TokenQuotedLit, Bytes: []byte(fmt.Sprintf("data.azuread_group.%s.id", formattedGroupName))})
+			// if not the last group, add a comma
+			if i < len(groups)-1 {
+				groupTokens = append(groupTokens, &hclwrite.Token{Type: hclsyntax.TokenComma, Bytes: []byte{','}})
+			}
+		}
+		groupTokens = append(groupTokens, &hclwrite.Token{Type: hclsyntax.TokenCBrack, Bytes: []byte{']'}})
+		body.SetAttributeRaw(attribute, groupTokens)
+	}
+
 	// Add users block
 	usersBlock := conditionsBlockBody.AppendNewBlock("users", nil)
 	usersBlockBody := usersBlock.Body()
-	setIfNotEmpty(usersBlockBody, "included_users", policy.GetConditions().GetUsers().GetIncludeUsers())
-	setIfNotEmpty(usersBlockBody, "excluded_users", policy.GetConditions().GetUsers().GetExcludeUsers())
-	setIfNotEmpty(usersBlockBody, "included_groups", policy.GetConditions().GetUsers().GetIncludeGroups())
-	setIfNotEmpty(usersBlockBody, "excluded_groups", policy.GetConditions().GetUsers().GetExcludeGroups())
+	appendUsersBlock(usersBlockBody, policy.GetConditions().GetUsers().GetIncludeUsers(), "included_users")
+	appendUsersBlock(usersBlockBody, policy.GetConditions().GetUsers().GetExcludeUsers(), "excluded_users")
+	appendGroupsBlock(usersBlockBody, policy.GetConditions().GetUsers().GetIncludeGroups(), "included_groups")
+	appendGroupsBlock(usersBlockBody, policy.GetConditions().GetUsers().GetExcludeGroups(), "excluded_groups")
 	setIfNotEmpty(usersBlockBody, "included_roles", policy.GetConditions().GetUsers().GetIncludeRoles())
 	setIfNotEmpty(usersBlockBody, "excluded_roles", policy.GetConditions().GetUsers().GetExcludeRoles())
 
